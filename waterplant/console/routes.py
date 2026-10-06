@@ -89,6 +89,22 @@ def route_table() -> list[Route]:
         Route("POST", "/metrics/reset", "reset console request counters", "metrics_reset"),
         Route("GET", "/export/audit", "dosing audit trail as CSV", "export_audit"),
         Route("GET", "/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/settle", "latest per chemical per shift settlement segments", "settle_state"),
+        Route("POST", "/settle/compute", "collect and reconcile shifts", "settle_compute"),
+        Route("POST", "/settle/recover", "repair partial settlement and recompute", "settle_recover"),
+        Route("GET", "/settle/segments", "latest segments or one segment history", "settle_segments"),
+        Route("GET", "/settle/runs", "append only settlement run documents", "settle_runs"),
+        Route("GET", "/settle/schedule", "read crew shift arrangement", "settle_schedule_get"),
+        Route("POST", "/settle/schedule", "replace crew shift arrangement", "settle_schedule_arrange"),
+        Route("GET", "/settle/calibrations", "effective dated calibration versions", "settle_calibrations"),
+        Route("POST", "/settle/calibrations", "register a calibration version", "settle_calibration_register"),
+        Route("GET", "/settle/concentrations", "effective dated concentration versions", "settle_concentrations"),
+        Route("POST", "/settle/concentrations", "register a concentration version", "settle_concentration_register"),
+        Route("GET", "/settle/makeups", "supplementary doses and dangling markers", "settle_makeups"),
+        Route("POST", "/settle/makeups", "record a makeup dose against a shift", "settle_makeup_add"),
+        Route("GET", "/settle/meter", "cumulative meter readings", "settle_meter_readings"),
+        Route("POST", "/settle/meter", "record a cumulative meter reading", "settle_meter_reading_add"),
+        Route("POST", "/settle/meter/cap", "read or set a meter wrap cap", "settle_meter_cap"),
     ]
 
 

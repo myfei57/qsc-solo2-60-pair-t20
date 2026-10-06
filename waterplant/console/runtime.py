@@ -14,6 +14,7 @@ from waterplant.inventory import Inventory
 from waterplant.ph import Stabilizer
 from waterplant.quota import Accumulator
 from waterplant.scheduler import Scheduler
+from waterplant.settle import Settlement
 from waterplant.store import Store
 from waterplant.turb import Sampler
 
@@ -41,3 +42,4 @@ class Runtime:
         self.scheduler = Scheduler(store)
         self.trend = Trend(store)
         self.inventory = Inventory(store)
+        self.settlement = Settlement(store)

@@ -45,6 +45,7 @@ class ConsoleCase(unittest.TestCase):
             "intake",
             "ph",
             "inventory",
+            "settlement",
         })
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -68,6 +69,7 @@ class ConsoleCase(unittest.TestCase):
                 "schedule",
                 "trend",
                 "inventory",
+                "settlement",
             },
         )
 
@@ -402,6 +404,129 @@ class WsgiCase(unittest.TestCase):
             self.assertEqual(captured["status"], "200 OK")
             self.assertEqual(json.loads(body)["dose"], 5.0)
             store.close()
+
+
+class SettlementConsoleCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/state.json")
+        seed_defaults(self.store)
+        self.server = Server(self.store)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def call(self, method: str, path: str, payload: dict | None = None):
+        response = self.server.dispatch(method, path, payload)
+        return response.status, json.loads(response.body.decode("utf-8"))
+
+    def test_settle_collection_makeup_and_recovery(self) -> None:
+        status, _ = self.call(
+            "POST",
+            "/settle/calibrations",
+            {"chemical": "coagulant", "value": 1.0, "effective_from": "2026-01-01T00:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+
+        from waterplant.audit import Auditor
+
+        Auditor(self.store).record("coagulant", "10.0", at="2026-10-05T09:00:00Z")
+        status, _ = self.call(
+            "POST",
+            "/inventory/receive",
+            {"chemical": "coagulant", "lot_id": "L1", "amount": 100.0, "at": "2026-10-05T08:30:00Z"},
+        )
+        self.assertEqual(status, 200)
+        status, _ = self.call(
+            "POST",
+            "/inventory/consume",
+            {"chemical": "coagulant", "amount": 10.0, "at": "2026-10-05T12:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+        status, _ = self.call(
+            "POST", "/settle/meter", {"chemical": "coagulant", "value": 0.0, "at": "2026-10-05T08:00:00Z"}
+        )
+        self.assertEqual(status, 200)
+        status, _ = self.call(
+            "POST", "/settle/meter", {"chemical": "coagulant", "value": 10.0, "at": "2026-10-05T15:59:00Z"}
+        )
+        self.assertEqual(status, 200)
+
+        status, run = self.call("POST", "/settle/compute", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(run["status"], "complete")
+        segment = run["segments"][0]
+        self.assertEqual(segment["status"], "reconciled")
+        self.assertEqual(segment["meter"], 10.0)
+        self.assertEqual(segment["stock"], 10.0)
+
+        # recompute is idempotent and does not append another run
+        status, rerun = self.call("POST", "/settle/compute", {})
+        self.assertTrue(rerun["idempotent"])
+        self.assertEqual(rerun["run_id"], run["run_id"])
+
+        # correction the next day settles against the old shift
+        shift_key = segment["shift_key"]
+        status, makeup = self.call(
+            "POST",
+            "/settle/makeups",
+            {
+                "chemical": "coagulant",
+                "amount": 2.0,
+                "for_shift": shift_key,
+                "reason": "underdose",
+                "at": "2026-10-06T09:00:00Z",
+                "meter_value": 12.0,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(makeup["audit_id"])
+        status, state = self.call("GET", "/settle")
+        self.assertEqual(state["stale_count"], 1)
+
+        status, rerun = self.call("POST", "/settle/compute", {})
+        target = [seg for seg in rerun["segments"] if seg["shift_key"] == shift_key][0]
+        self.assertEqual(target["dosed_raw"], 12.0)
+        self.assertEqual(target["meter"], 12.0)
+        self.assertEqual(target["stock"], 12.0)
+        self.assertEqual(target["status"], "reconciled")
+
+        status, history = self.call(
+            "GET", "/settle/segments", {"chemical": "coagulant", "shift_key": shift_key}
+        )
+        # initial run, post-makeup run, then the forced recovery rerun: all
+        # but the newest are retained as superseded (append only history)
+        self.assertEqual([row["state"] for row in history["segments"]][-1], "current")
+        self.assertTrue(
+            all(row["state"] == "superseded" for row in history["segments"][:-1])
+        )
+
+        status, recovered = self.call("POST", "/settle/recover", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(recovered["run"]["status"], "complete")
+
+    def test_arrange_schedule_pins_boundary_policy(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/settle/schedule",
+            {
+                "boundary_policy": "handover",
+                "roster": [
+                    {"crew": "A", "start_minute": 7 * 60 + 30},
+                    {"crew": "B", "start_minute": 15 * 60 + 30},
+                    {"crew": "C", "start_minute": 23 * 60 + 30},
+                ],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["boundary_policy"], "handover")
+        status, bad = self.call(
+            "POST",
+            "/settle/schedule",
+            {"boundary_policy": "nonsense", "roster": [{"crew": "A", "start_minute": 0}]},
+        )
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

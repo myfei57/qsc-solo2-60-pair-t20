@@ -8,6 +8,7 @@ from waterplant.intake import DEFAULT_WINDOW, WINDOW_KEY, FlowRepository, Trend
 from waterplant.ph import DEFAULT_PH, PH_KEY, Stabilizer
 from waterplant.quota import Accumulator
 from waterplant.scheduler import DEFAULT_THRESHOLD, THRESHOLD_KEY, Scheduler
+from waterplant.settle import ShiftSchedule
 from waterplant.store import Store, append_event, has_key
 
 from .history import EVENT_KEY
@@ -42,5 +43,7 @@ def seed_defaults(store: Store) -> None:
     trend = Trend(store)
     if not has_key(store, WINDOW_KEY):
         trend.set_window(DEFAULT_WINDOW)
+
+    ShiftSchedule(store).use_defaults()
 
     append_event(store, EVENT_KEY, "seed", "defaults")

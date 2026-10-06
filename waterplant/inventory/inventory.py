@@ -4,22 +4,64 @@ Stock arrives in lots and is drawn down first in, first out so a partial
 consumption always leaves the older lot in front. Every lot remembers how
 much was received and how much has since been consumed, which keeps the
 reorder calculation independent of the dosing audit trail.
+
+Every receipt and consumption is additionally appended to an immutable
+movement log (``inventory:movements``) so settlement can total stock drawn
+during a crew shift without reconstructing it from current lot balances.
 """
 
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
+from waterplant.store.commands import append_command, load_commands
 from waterplant.store.epoch import load_float, save_float
 from waterplant.store.store import Store
 
 from .report import InventoryState
 
 LOTS_KEY = "inventory:lots"
+MOVEMENTS_KEY = "inventory:movements"
 REORDER_KEY = "inventory:reorder-level"
 DEFAULT_REORDER_LEVEL = 25.0
 EPSILON = 1e-9
+STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _epoch_of(stamp: str) -> int:
+    text = stamp.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+@dataclass(frozen=True)
+class Movement:
+    """One immutable inventory receipt or consumption."""
+
+    id: str
+    chemical: str
+    kind: str
+    amount: float
+    at: str
+    ref: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "chemical": self.chemical,
+            "kind": self.kind,
+            "amount": self.amount,
+            "at": self.at,
+            "ref": self.ref,
+        }
 
 
 @dataclass
@@ -77,16 +119,97 @@ class Inventory:
     def _save(self, lots: list[Lot]) -> None:
         self._store.put(LOTS_KEY, json.dumps([lot.as_dict() for lot in lots], ensure_ascii=False))
 
-    def receive(self, chemical: str, lot_id: str, amount: float) -> Lot:
+    def _append_movement(
+        self, kind: str, chemical: str, amount: float, at: str | None, ref: str
+    ) -> None:
+        movement = Movement(
+            id=uuid.uuid4().hex,
+            chemical=chemical,
+            kind=kind,
+            amount=float(amount),
+            at=at if at is not None else time.strftime(STAMP_FORMAT, time.gmtime()),
+            ref=ref,
+        )
+        append_command(self._store, MOVEMENTS_KEY, json.dumps(movement.as_dict(), ensure_ascii=False))
+
+    def movements(self, chemical: str | None = None, kind: str | None = None) -> list[Movement]:
+        """Return the immutable movement log, oldest first."""
+
+        movements: list[Movement] = []
+        for item in load_commands(self._store, MOVEMENTS_KEY):
+            try:
+                payload = json.loads(item)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            name = str(payload.get("chemical", ""))
+            entry_kind = str(payload.get("kind", ""))
+            if chemical is not None and name != chemical:
+                continue
+            if kind is not None and entry_kind != kind:
+                continue
+            try:
+                amount = float(payload.get("amount", ""))
+            except ValueError:
+                continue
+            movements.append(
+                Movement(
+                    id=str(payload.get("id", "")),
+                    chemical=name,
+                    kind=entry_kind,
+                    amount=amount,
+                    at=str(payload.get("at", "")),
+                    ref=str(payload.get("ref", "")),
+                )
+            )
+        return sorted(movements, key=lambda movement: _epoch_of(movement.at))
+
+    def consumed_by_shift(
+        self,
+        chemical: str,
+        shift_windows: list[tuple[str, int, int]],
+        reattribute: dict[str, str] | None = None,
+    ) -> dict[str, dict[str, object]]:
+        """Total consumed stock per supplied shift window (start < at <= end).
+
+        ``reattribute`` maps a movement reference (``makeup:<audit id>``) to a
+        different shift key, so the stock drawn by a correction during a later
+        crew is collected into the shift it corrected.
+        """
+
+        reattribute = reattribute or {}
+        rows: dict[str, dict[str, object]] = {}
+        for movement in self.movements(chemical, "consume"):
+            when = _epoch_of(movement.at)
+            owner = reattribute.get(movement.ref)
+            if owner is None:
+                for shift_key, start, end in shift_windows:
+                    if start < when <= end:
+                        owner = shift_key
+                        break
+            if owner is None:
+                continue
+            row = rows.setdefault(owner, {"stock": 0.0, "movement_ids": []})
+            row["stock"] = float(row["stock"]) + movement.amount
+            row["movement_ids"].append(movement.id)
+        return rows
+
+    def receive(
+        self, chemical: str, lot_id: str, amount: float, at: str | None = None
+    ) -> Lot:
         """Book a new lot into stock."""
 
         lots = self._load()
         lot = Lot(chemical=chemical, lot_id=lot_id, received=amount)
         lots.append(lot)
         self._save(lots)
+        self._append_movement("receive", chemical, amount, at, lot_id)
         return lot
 
-    def consume(self, chemical: str, amount: float) -> float:
+    def consume(
+        self, chemical: str, amount: float, at: str | None = None, ref: str = ""
+    ) -> float:
         """Draw ``amount`` of a chemical down, oldest lot first."""
 
         lots = self._load()
@@ -105,6 +228,7 @@ class Inventory:
         if outstanding > EPSILON:
             raise ValueError(f"insufficient {chemical} inventory")
         self._save(lots)
+        self._append_movement("consume", chemical, amount, at, ref)
         return amount
 
     def lots(self, chemical: str | None = None) -> list[Lot]:

@@ -34,10 +34,10 @@ class Auditor:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def record(self, kind: str, detail: str) -> Entry:
+    def record(self, kind: str, detail: str, at: str | None = None) -> Entry:
         entry = Entry(
             id=uuid.uuid4().hex,
-            time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            time=at if at is not None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             kind=kind,
             detail=detail,
         )

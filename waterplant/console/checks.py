@@ -36,4 +36,21 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
         )
     else:
         checks.append({"name": "inventory", "status": "ok", "detail": "stock above reorder level"})
+    settle = rt.settlement.state()
+    if settle["error_count"]:
+        checks.append(
+            {"name": "settlement", "status": "fail", "detail": f"{settle['error_count']} segment error(s); recover needed"}
+        )
+    elif settle["mismatch_count"] or settle["stale_count"]:
+        checks.append(
+            {
+                "name": "settlement",
+                "status": "warn",
+                "detail": (
+                    f"mismatch={settle['mismatch_count']} stale={settle['stale_count']}"
+                ),
+            }
+        )
+    else:
+        checks.append({"name": "settlement", "status": "ok", "detail": f"{len(settle['segments'])} segment(s) current"})
     return checks

@@ -15,6 +15,7 @@ from waterplant.ph import validate_ph
 from waterplant.quota import Quota, check_quota, validate_amount
 from waterplant.reporting import audit_export, telemetry_export, to_csv
 from waterplant.scheduler import validate_threshold
+from waterplant.settle import HANDOVER, BOUNDARY_POLICIES
 from waterplant.store import export_state
 
 from . import checks, history, ops
@@ -23,7 +24,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -347,7 +348,10 @@ def inventory_receive(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_quantity(amount)
     lot = server.runtime.inventory.receive(
-        request.str_field("chemical"), request.str_field("lot_id"), amount
+        request.str_field("chemical"),
+        request.str_field("lot_id"),
+        amount,
+        at=request.str_field("at") or None,
     )
     return json_response({"lot": lot.as_dict()})
 
@@ -356,7 +360,9 @@ def inventory_consume(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_quantity(amount)
     chemical = request.str_field("chemical")
-    consumed = server.runtime.inventory.consume(chemical, amount)
+    at = request.str_field("at") or None
+    ref = request.str_field("ref")
+    consumed = server.runtime.inventory.consume(chemical, amount, at=at, ref=ref)
     return json_response(
         {"consumed": consumed, "balance": server.runtime.inventory.balance(chemical)}
     )
@@ -380,6 +386,182 @@ def metrics_reset(server: "Server", request: Request) -> Response:
 def export_audit(server: "Server", request: Request) -> Response:
     columns, rows = audit_export(server.runtime.auditor)
     return csv_response(to_csv(columns, rows))
+
+
+def _shift_keys(request: Request) -> set[str] | None:
+    keys = request.payload.get("shift_keys")
+    if keys is None:
+        return None
+    if not isinstance(keys, list):
+        raise RequestError(400, "shift_keys must be a list")
+    return {str(key) for key in keys}
+
+
+def _chemical_filter(request: Request) -> list[str] | None:
+    chemicals = request.payload.get("chemicals")
+    if chemicals is None:
+        return None
+    if not isinstance(chemicals, list):
+        raise RequestError(400, "chemicals must be a list")
+    return [str(item) for item in chemicals]
+
+
+def settle_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.settlement.state())
+
+
+def settle_compute(server: "Server", request: Request) -> Response:
+    force = bool(request.payload.get("force", False))
+    run = server.runtime.settlement.compute(
+        shift_keys=_shift_keys(request),
+        chemicals=_chemical_filter(request),
+        force=force,
+    )
+    return json_response(run)
+
+
+def settle_recover(server: "Server", request: Request) -> Response:
+    result = server.runtime.settlement.recover(shift_keys=_shift_keys(request))
+    return json_response(result)
+
+
+def settle_segments(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    shift_key = request.str_field("shift_key")
+    if chemical and shift_key:
+        return json_response(
+            {"segments": server.runtime.settlement.segment_history(chemical, shift_key)}
+        )
+    return json_response({"segments": server.runtime.settlement.latest_segments()})
+
+
+def settle_runs(server: "Server", request: Request) -> Response:
+    return json_response({"runs": server.runtime.settlement.runs()})
+
+
+def settle_schedule_get(server: "Server", request: Request) -> Response:
+    schedule = server.runtime.settlement.schedule
+    return json_response(
+        {
+            **schedule.state(),
+            "current": schedule.current().as_dict(),
+        }
+    )
+
+
+def settle_schedule_arrange(server: "Server", request: Request) -> Response:
+    payload_roster = request.payload.get("roster")
+    if not isinstance(payload_roster, list) or not payload_roster:
+        raise RequestError(400, "roster must be a non empty list of {crew,start_minute}")
+    roster: list[tuple[str, int]] = []
+    for item in payload_roster:
+        if not isinstance(item, dict):
+            raise RequestError(400, "each roster row must be an object")
+        roster.append((str(item["crew"]), int(item["start_minute"])))
+    policy = request.str_field("boundary_policy", HANDOVER)
+    if policy not in BOUNDARY_POLICIES:
+        raise RequestError(400, f"boundary_policy must be one of {BOUNDARY_POLICIES}")
+    segments = server.runtime.settlement.schedule.arrange(roster, policy)
+    return json_response(
+        {
+            "boundary_policy": policy,
+            "roster": [segment.as_dict() for segment in segments],
+        }
+    )
+
+
+def settle_calibrations(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    versions = server.runtime.settlement.calibrations.versions(chemical or None)
+    return json_response({"versions": [version.as_dict() for version in versions]})
+
+
+def settle_calibration_register(server: "Server", request: Request) -> Response:
+    value = request.float_field("value")
+    if value <= 0:
+        raise RequestError(400, "calibration value must be positive")
+    effective_from = request.str_field("effective_from") or None
+    version = server.runtime.settlement.calibrations.register(
+        request.str_field("chemical"),
+        value,
+        effective_from=effective_from,
+        note=request.str_field("note"),
+    )
+    return json_response(version.as_dict())
+
+
+def settle_concentrations(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    versions = server.runtime.settlement.concentrations.versions(chemical or None)
+    return json_response({"versions": [version.as_dict() for version in versions]})
+
+
+def settle_concentration_register(server: "Server", request: Request) -> Response:
+    value = request.float_field("value")
+    if value <= 0:
+        raise RequestError(400, "concentration value must be positive")
+    effective_from = request.str_field("effective_from") or None
+    version = server.runtime.settlement.concentrations.register(
+        request.str_field("chemical"),
+        value,
+        effective_from=effective_from,
+        note=request.str_field("note"),
+    )
+    return json_response(version.as_dict())
+
+
+def settle_makeups(server: "Server", request: Request) -> Response:
+    makeup_ledger = server.runtime.settlement.makeups
+    chemical = request.str_field("chemical")
+    shift_key = request.str_field("shift_key")
+    makeups = makeup_ledger.makeups(chemical or None, shift_key or None)
+    return json_response(
+        {"makeups": [makeup.as_dict() for makeup in makeups], "dangling": [
+            makeup.as_dict() for makeup in makeup_ledger.dangling()
+        ]}
+    )
+
+
+def settle_makeup_add(server: "Server", request: Request) -> Response:
+    amount = request.float_field("amount")
+    at = request.str_field("at") or None
+    raw_meter = request.payload.get("meter_value")
+    meter_value = None if raw_meter is None else float(raw_meter)
+    draw_stock = bool(request.payload.get("draw_stock", True))
+    makeup = server.runtime.settlement.makeups.add(
+        chemical=request.str_field("chemical"),
+        amount=amount,
+        for_shift=request.str_field("for_shift"),
+        reason=request.str_field("reason"),
+        at=at,
+        draw_stock=draw_stock,
+        meter_value=meter_value,
+    )
+    return json_response(makeup.as_dict())
+
+
+def settle_meter_readings(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    readings = server.runtime.settlement.meters.readings(chemical or None)
+    return json_response({"readings": [reading.as_dict() for reading in readings]})
+
+
+def settle_meter_reading_add(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    value = request.float_field("value")
+    at = request.str_field("at") or None
+    source = request.str_field("source") or "manual"
+    reading = server.runtime.settlement.meters.reading(chemical, value, at=at, source=source)
+    return json_response(reading.as_dict())
+
+
+def settle_meter_cap(server: "Server", request: Request) -> Response:
+    chemical = request.str_field("chemical")
+    meters = server.runtime.settlement.meters
+    if request.payload.get("cap") is None:
+        return json_response({"chemical": chemical, "wrap_cap": meters.wrap_cap(chemical)})
+    cap = request.float_field("cap")
+    return json_response({"chemical": chemical, "wrap_cap": meters.set_wrap_cap(chemical, cap)})
 
 
 def export_telemetry(server: "Server", request: Request) -> Response:
