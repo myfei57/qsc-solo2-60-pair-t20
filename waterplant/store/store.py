@@ -54,6 +54,13 @@ class Store:
             self._data[key] = value
             self._save_locked()
 
+    def put_many(self, values: dict[str, str]) -> None:
+        """Write several keys atomically with one durable snapshot."""
+
+        with self._lock:
+            self._data.update(values)
+            self._save_locked()
+
     def delete(self, key: str) -> None:
         with self._lock:
             if key not in self._data:

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from waterplant.store.epoch import load_float, save_float
 from waterplant.store.store import Store
 
+from .movements import MOVEMENTS_KEY, append_movement
 from .report import InventoryState
 
 LOTS_KEY = "inventory:lots"
@@ -77,34 +78,65 @@ class Inventory:
     def _save(self, lots: list[Lot]) -> None:
         self._store.put(LOTS_KEY, json.dumps([lot.as_dict() for lot in lots], ensure_ascii=False))
 
-    def receive(self, chemical: str, lot_id: str, amount: float) -> Lot:
+    def receive(
+        self,
+        chemical: str,
+        lot_id: str,
+        amount: float,
+        record_movement: bool = True,
+        at: str | None = None,
+    ) -> Lot:
         """Book a new lot into stock."""
 
         lots = self._load()
         lot = Lot(chemical=chemical, lot_id=lot_id, received=amount)
         lots.append(lot)
-        self._save(lots)
+        values = {LOTS_KEY: json.dumps([item.as_dict() for item in lots], ensure_ascii=False)}
+        if record_movement:
+            movement, items = append_movement(self._store, chemical, "receive", amount, lot_id, at)
+            values[MOVEMENTS_KEY] = json.dumps(items, ensure_ascii=False)
+        self._store.put_many(values)
         return lot
 
-    def consume(self, chemical: str, amount: float) -> float:
+    def consume(
+        self,
+        chemical: str,
+        amount: float,
+        lot_id: str | None = None,
+        record_movement: bool = True,
+        at: str | None = None,
+    ) -> float:
         """Draw ``amount`` of a chemical down, oldest lot first."""
 
         lots = self._load()
         outstanding = amount
+        allocations: list[tuple[str, float]] = []
         for lot in lots:
             if lot.chemical != chemical:
+                continue
+            if lot_id is not None and lot.lot_id != lot_id:
                 continue
             available = lot.remaining()
             if available <= EPSILON:
                 continue
             taken = available if available < outstanding else outstanding
             lot.consumed += taken
+            allocations.append((lot.lot_id, taken))
             outstanding -= taken
             if outstanding <= EPSILON:
                 break
         if outstanding > EPSILON:
             raise ValueError(f"insufficient {chemical} inventory")
-        self._save(lots)
+        values = {LOTS_KEY: json.dumps([item.as_dict() for item in lots], ensure_ascii=False)}
+        if record_movement:
+            movement_items = None
+            for allocated_lot, taken in allocations:
+                movement, movement_items = append_movement(
+                    self._store, chemical, "consume", taken, allocated_lot, at
+                )
+            if movement_items is not None:
+                values[MOVEMENTS_KEY] = json.dumps(movement_items, ensure_ascii=False)
+        self._store.put_many(values)
         return amount
 
     def lots(self, chemical: str | None = None) -> list[Lot]:

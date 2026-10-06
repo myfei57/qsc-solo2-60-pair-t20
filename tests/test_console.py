@@ -45,6 +45,7 @@ class ConsoleCase(unittest.TestCase):
             "intake",
             "ph",
             "inventory",
+            "aggregation",
         })
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -68,6 +69,8 @@ class ConsoleCase(unittest.TestCase):
                 "schedule",
                 "trend",
                 "inventory",
+                "shift_schedule",
+                "aggregation",
             },
         )
 
@@ -333,6 +336,82 @@ class ConsoleCase(unittest.TestCase):
         self.assertTrue(body["reset"])
         _, body = self.call("GET", "/metrics")
         self.assertEqual(body["requests"], 1)
+
+    def test_dosing_aggregation_routes(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/dosing/schedule",
+            {"handover_minutes": [480, 960], "teams": ["day", "night"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["boundary_policy"], "handover")
+
+        status, body = self.call(
+            "POST", "/dosing/basis", {"chemical": "coagulant", "calibration": 1.0, "concentration": 1.0}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["entry"]["chemical"], "coagulant")
+
+        self.call(
+            "POST",
+            "/inventory/receive",
+            {"chemical": "coagulant", "lot_id": "L1", "amount": 100.0, "time": "2026-10-05T08:00:00Z"},
+        )
+        status, body = self.call(
+            "POST",
+            "/coag/dose",
+            {"flow": 10.0, "time": "2026-10-05T09:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["dose"], 10.0)
+        status, _ = self.call(
+            "POST",
+            "/inventory/consume",
+            {
+                "chemical": "coagulant",
+                "amount": 12.0,
+                "time": "2026-10-05T10:30:00Z",
+            },
+        )
+        self.assertEqual(status, 200)
+        status, body = self.call(
+            "POST",
+            "/dosing/supplement",
+            {
+                "chemical": "coagulant",
+                "amount": 2.0,
+                "time": "2026-10-05T10:00:00Z",
+                "raw_amount": 2.0,
+                "calibration": 1.0,
+                "concentration": 1.0,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["entry"]["dose_type"], "supplement")
+
+        status, body = self.call(
+            "POST",
+            "/dosing/cumulative",
+            {"chemical": "coagulant", "value": 0.0, "rollover": 100.0, "time": "2026-10-05T08:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+        status, body = self.call(
+            "POST",
+            "/dosing/cumulative",
+            {"chemical": "coagulant", "value": 12.0, "rollover": 100.0, "time": "2026-10-05T16:00:00Z"},
+        )
+        self.assertEqual(status, 200)
+
+        status, body = self.call("POST", "/dosing/aggregate", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["run"]["failed"], 0)
+        status, body = self.call("GET", "/dosing/aggregates", {"chemical": "coagulant"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["results"])
+        self.assertEqual(body["state"]["discrepancy_policy"], "publish-and-mark")
+        status, body = self.call("GET", "/dosing/movements", {"chemical": "coagulant"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["entries"])
 
     def test_export_routes(self) -> None:
         self.call("POST", "/coag/dose", {"flow": 5.0})

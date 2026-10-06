@@ -49,5 +49,7 @@ def text_report(rt: Runtime) -> str:
             f"inventory balance={telemetry.inventory_balance:.4f} "
             f"alerts={telemetry.inventory_alerts}"
         ),
+        f"shift: {describe['shift_schedule']}",
+        f"aggregation: {describe['aggregation']}",
     ]
     return "\n".join(rows) + "\n"

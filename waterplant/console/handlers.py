@@ -121,7 +121,9 @@ def intake_flow_get(server: "Server", request: Request) -> Response:
 def coag_dose(server: "Server", request: Request) -> Response:
     flow = request.float_field("flow")
     validate_flow(flow)
-    dose = server.runtime.coag_doser.update_flow_and_dose(flow)
+    dose = server.runtime.coag_doser.update_flow_and_dose(
+        flow, request.optional_str("time")
+    )
     return json_response({"dose": dose})
 
 
@@ -139,7 +141,9 @@ def flow_replace(server: "Server", request: Request) -> Response:
     validate_factor(factor)
     meter = calibrate_meter(request.str_field("serial"), factor)
     server.runtime.calibration.replace(meter.factor)
-    return json_response({"meter": meter.as_dict()})
+    concentration = request.float_field("concentration", 1.0)
+    server.runtime.basis.set("coagulant", meter.factor, concentration)
+    return json_response({"meter": meter.as_dict(), "concentration": concentration})
 
 
 def chlor_target(server: "Server", request: Request) -> Response:
@@ -252,7 +256,9 @@ def backwash_replay(server: "Server", request: Request) -> Response:
 def quota_add(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_amount(amount)
-    return json_response({"value": server.runtime.accumulator.add(amount)})
+    return json_response(
+        {"value": server.runtime.accumulator.add(amount, request.optional_str("time"))}
+    )
 
 
 def quota_get(server: "Server", request: Request) -> Response:
@@ -347,7 +353,11 @@ def inventory_receive(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_quantity(amount)
     lot = server.runtime.inventory.receive(
-        request.str_field("chemical"), request.str_field("lot_id"), amount
+        request.str_field("chemical"),
+        request.str_field("lot_id"),
+        amount,
+        record_movement=bool(request.payload.get("record_movement", True)),
+        at=request.optional_str("time"),
     )
     return json_response({"lot": lot.as_dict()})
 
@@ -356,7 +366,13 @@ def inventory_consume(server: "Server", request: Request) -> Response:
     amount = request.float_field("amount")
     validate_quantity(amount)
     chemical = request.str_field("chemical")
-    consumed = server.runtime.inventory.consume(chemical, amount)
+    consumed = server.runtime.inventory.consume(
+        chemical,
+        amount,
+        lot_id=request.optional_str("lot_id"),
+        record_movement=bool(request.payload.get("record_movement", True)),
+        at=request.optional_str("time"),
+    )
     return json_response(
         {"consumed": consumed, "balance": server.runtime.inventory.balance(chemical)}
     )
@@ -366,6 +382,113 @@ def inventory_reorder_level(server: "Server", request: Request) -> Response:
     level = request.float_field("level")
     validate_quantity(level, "level")
     return json_response({"reorder_level": server.runtime.inventory.set_reorder_level(level)})
+
+
+def dosing_schedule_get(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.shift_schedule.state().as_dict())
+
+
+def dosing_schedule_set(server: "Server", request: Request) -> Response:
+    raw_minutes = request.payload.get("handover_minutes")
+    if raw_minutes is None:
+        raw_minutes = request.payload.get("handovers", [])
+    if not isinstance(raw_minutes, list):
+        raise ValueError("handover_minutes must be a list")
+    try:
+        minutes = [int(item) for item in raw_minutes]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("handover_minutes must be integers") from exc
+    state = server.runtime.shift_schedule.set(minutes, request.str_list("teams") or None)
+    return json_response(state.as_dict())
+
+
+def dosing_basis_list(server: "Server", request: Request) -> Response:
+    chemical = request.optional_str("chemical") or request.query_str("chemical")
+    entries = server.runtime.basis.entries(chemical)
+    return json_response({"entries": [entry.as_dict() for entry in entries]})
+
+
+def dosing_basis_set(server: "Server", request: Request) -> Response:
+    entry = server.runtime.basis.set(
+        request.str_field("chemical"),
+        request.float_field("calibration", 1.0),
+        request.float_field("concentration", 1.0),
+        effective_from=request.optional_str("effective_from"),
+    )
+    if entry.chemical == "coagulant":
+        server.runtime.calibration.replace(entry.calibration)
+    return json_response({"entry": entry.as_dict()})
+
+
+def dosing_supplement(server: "Server", request: Request) -> Response:
+    amount = request.float_field("amount")
+    validate_quantity(amount, "amount")
+    entry = server.runtime.auditor.supplement(
+        request.str_field("chemical"),
+        amount,
+        at=request.optional_str("time"),
+        raw_amount=request.optional_float("raw_amount"),
+        calibration=request.optional_float("calibration"),
+        concentration=request.optional_float("concentration"),
+    )
+    return json_response({"entry": entry.as_dict()})
+
+
+def dosing_cumulative_list(server: "Server", request: Request) -> Response:
+    chemical = request.query_str("chemical") or request.optional_str("chemical") or ""
+    entries = server.runtime.cumulative.entries(chemical)
+    return json_response({"entries": [entry.as_dict() for entry in entries]})
+
+
+def dosing_cumulative_record(server: "Server", request: Request) -> Response:
+    value = request.float_field("value")
+    validate_quantity(value, "value")
+    raw_rollover = request.payload.get("rollover", 100.0)
+    rollover = None if raw_rollover is None else float(raw_rollover)
+    entry = server.runtime.cumulative.record(
+        request.str_field("chemical"),
+        value,
+        at=request.optional_str("time"),
+        rollover=rollover,
+    )
+    return json_response({"entry": entry.as_dict()})
+
+
+def dosing_movements_list(server: "Server", request: Request) -> Response:
+    chemical = request.optional_str("chemical")
+    entries = server.runtime.movements.entries(chemical)
+    return json_response({"entries": [entry.as_dict() for entry in entries]})
+
+
+def dosing_movements_record(server: "Server", request: Request) -> Response:
+    amount = request.float_field("amount")
+    validate_quantity(amount, "amount")
+    entry = server.runtime.movements.record(
+        request.str_field("chemical"),
+        request.str_field("kind", "consume"),
+        amount,
+        lot_id=request.str_field("lot_id"),
+        at=request.optional_str("time"),
+    )
+    return json_response({"entry": entry.as_dict()})
+
+
+def dosing_aggregate(server: "Server", request: Request) -> Response:
+    run = server.runtime.aggregator.run(
+        request.optional_str("chemical") or request.query_str("chemical"),
+    )
+    return json_response({"run": run.as_dict(), "state": server.runtime.aggregator.state().as_dict()})
+
+
+def dosing_aggregates(server: "Server", request: Request) -> Response:
+    chemical = request.optional_str("chemical") or request.query_str("chemical")
+    results = server.runtime.aggregator.active_results(chemical)
+    return json_response(
+        {
+            "results": [result.as_dict() for result in results],
+            "state": server.runtime.aggregator.state().as_dict(),
+        }
+    )
 
 
 def metrics(server: "Server", request: Request) -> Response:

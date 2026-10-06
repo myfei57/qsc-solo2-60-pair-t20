@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from waterplant.audit import Auditor
+from waterplant.dosing.basis import BasisLedger
 from waterplant.flow import Calibration
 from waterplant.intake import FlowRepository
 from waterplant.store.store import Store
@@ -18,6 +19,7 @@ class Doser:
     def __init__(self, store: Store) -> None:
         self._flow = FlowRepository(store)
         self._calibration = Calibration(store)
+        self._basis = BasisLedger(store)
         self._auditor = Auditor(store)
 
     @property
@@ -30,10 +32,12 @@ class Doser:
         return self._calibration.current()
 
     def dose_for_flow(self, value: float) -> float:
-        return value * self.current_ratio()
+        basis = self._basis.latest(COAGULANT)
+        return value * self.current_ratio() * basis.concentration
 
     def dose_for_turbidity(self, turbidity: float) -> float:
-        return turbidity * self.current_ratio()
+        basis = self._basis.latest(COAGULANT)
+        return turbidity * self.current_ratio() * basis.concentration
 
     def dose_from_persisted_flow(self) -> float:
         value, present = self._flow.load_flow()
@@ -41,12 +45,20 @@ class Doser:
             return 0.0
         return self.dose_for_flow(value)
 
-    def update_flow_and_dose(self, value: float) -> float:
+    def update_flow_and_dose(self, value: float, at: str | None = None) -> float:
         """Persist the new flow, then dose against the value just written."""
 
         self._flow.persist_flow(value)
         dose = self.dose_from_persisted_flow()
-        self._auditor.record(COAGULANT, f"{dose:.4f}")
+        basis = self._basis.latest(COAGULANT)
+        self._auditor.record(
+            COAGULANT,
+            f"{dose:.4f}",
+            at=at,
+            raw_amount=value,
+            calibration=self.current_ratio(),
+            concentration=basis.concentration,
+        )
         return dose
 
     def dose_plan(self, flow: float, turbidity: float) -> float:

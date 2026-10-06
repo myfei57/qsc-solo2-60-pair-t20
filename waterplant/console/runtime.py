@@ -7,6 +7,13 @@ from waterplant.backwash import Controller
 from waterplant.chlor import Doser as ChlorDoser
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
+from waterplant.dosing import (
+    Aggregator,
+    BasisLedger,
+    CumulativeLedger,
+    MovementLedger,
+    ShiftSchedule,
+)
 from waterplant.filter import Bank
 from waterplant.flow import Calibration
 from waterplant.intake import FlowRepository, InletController, Trend
@@ -41,3 +48,8 @@ class Runtime:
         self.scheduler = Scheduler(store)
         self.trend = Trend(store)
         self.inventory = Inventory(store)
+        self.shift_schedule = ShiftSchedule(store)
+        self.basis = BasisLedger(store)
+        self.cumulative = CumulativeLedger(store)
+        self.movements = MovementLedger(store)
+        self.aggregator = Aggregator(store)

@@ -117,6 +117,26 @@ class Request:
             raise RequestError(400, f"field {name} must be a list of numbers")
         return [_to_float(name, item) for item in value]
 
+    def str_list(self, name: str) -> list[str]:
+        value = self.payload.get(name, [])
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)):
+            raise RequestError(400, f"field {name} must be a list of strings")
+        return [str(item) for item in value]
+
+    def optional_str(self, name: str) -> str | None:
+        value = self.payload.get(name)
+        return None if value is None else str(value)
+
+    def query_str(self, name: str, default: str | None = None) -> str | None:
+        values = self.query.get(name)
+        return default if not values else values[-1]
+
+    def optional_float(self, name: str) -> float | None:
+        value = self.payload.get(name)
+        return None if value is None else _to_float(name, value)
+
 
 Handler = Callable[["Server", Request], Response]
 

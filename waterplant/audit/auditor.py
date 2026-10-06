@@ -23,9 +23,26 @@ class Entry:
     time: str
     kind: str
     detail: str
+    dose_type: str = "dose"
+    raw_amount: float | None = None
+    calibration: float | None = None
+    concentration: float | None = None
 
-    def as_dict(self) -> dict[str, str]:
-        return {"id": self.id, "time": self.time, "kind": self.kind, "detail": self.detail}
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": self.id,
+            "time": self.time,
+            "kind": self.kind,
+            "detail": self.detail,
+            "dose_type": self.dose_type,
+        }
+        if self.raw_amount is not None:
+            payload["raw_amount"] = self.raw_amount
+        if self.calibration is not None:
+            payload["calibration"] = self.calibration
+        if self.concentration is not None:
+            payload["concentration"] = self.concentration
+        return payload
 
 
 class Auditor:
@@ -34,15 +51,54 @@ class Auditor:
     def __init__(self, store: Store) -> None:
         self._store = store
 
-    def record(self, kind: str, detail: str) -> Entry:
+    def record(
+        self,
+        kind: str,
+        detail: str,
+        at: str | None = None,
+        dose_type: str = "dose",
+        raw_amount: float | None = None,
+        calibration: float | None = None,
+        concentration: float | None = None,
+    ) -> Entry:
+        if dose_type not in {"dose", "supplement"}:
+            raise ValueError("dose_type must be dose or supplement")
         entry = Entry(
             id=uuid.uuid4().hex,
-            time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            time=at
+            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             kind=kind,
             detail=detail,
+            dose_type=dose_type,
+            raw_amount=raw_amount,
+            calibration=calibration,
+            concentration=concentration,
         )
         append_command(self._store, AUDIT_KEY, json.dumps(entry.as_dict(), ensure_ascii=False))
         return entry
+
+    def supplement(
+        self,
+        kind: str,
+        amount: float,
+        at: str | None = None,
+        raw_amount: float | None = None,
+        calibration: float | None = None,
+        concentration: float | None = None,
+    ) -> Entry:
+        """Append a late/manual dosing record without changing history."""
+
+        if amount < 0:
+            raise ValueError("supplement amount must be non-negative")
+        return self.record(
+            kind,
+            f"{amount:.4f}",
+            at=at,
+            dose_type="supplement",
+            raw_amount=raw_amount,
+            calibration=calibration,
+            concentration=concentration,
+        )
 
     def entries(self) -> list[Entry]:
         entries: list[Entry] = []
@@ -59,6 +115,10 @@ class Auditor:
                     time=str(payload.get("time", "")),
                     kind=str(payload.get("kind", "")),
                     detail=str(payload.get("detail", "")),
+                    dose_type=str(payload.get("dose_type", "dose")),
+                    raw_amount=_optional_float(payload.get("raw_amount")),
+                    calibration=_optional_float(payload.get("calibration")),
+                    concentration=_optional_float(payload.get("concentration")),
                 )
             )
         return entries
@@ -106,3 +166,9 @@ class Auditor:
 
     def describe(self) -> str:
         return f"audit entries={len(self.entries())}"
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)

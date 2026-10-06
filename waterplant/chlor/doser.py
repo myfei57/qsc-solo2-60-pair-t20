@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from waterplant.audit import Auditor
 from waterplant.clearwell import Well
+from waterplant.dosing.basis import BasisLedger
 from waterplant.store.store import Store
 
 from .report import ChlorState
@@ -16,6 +17,7 @@ class Doser:
 
     def __init__(self, store: Store) -> None:
         self._well = Well(store)
+        self._basis = BasisLedger(store)
         self._auditor = Auditor(store)
 
     def current_target(self) -> float:
@@ -30,7 +32,14 @@ class Doser:
         """Record a chlorine dose and return the amount applied."""
 
         dose = self.dose_for_residual()
-        self._auditor.record(CHLORINE, f"{dose:.4f}")
+        basis = self._basis.latest(CHLORINE)
+        self._auditor.record(
+            CHLORINE,
+            f"{dose:.4f}",
+            raw_amount=dose,
+            calibration=1.0,
+            concentration=basis.concentration,
+        )
         return dose
 
     def target_for_demand(self, demand: float) -> float:

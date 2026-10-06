@@ -28,4 +28,6 @@ def collect(rt: Runtime) -> dict[str, object]:
         "schedule": rt.scheduler.state(rt.bank).as_dict(),
         "trend": rt.trend.stats().as_dict(),
         "inventory": rt.inventory.state().as_dict(),
+        "shift_schedule": rt.shift_schedule.state().as_dict(),
+        "aggregation": rt.aggregator.state().as_dict(),
     }

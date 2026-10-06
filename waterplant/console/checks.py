@@ -36,4 +36,13 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
         )
     else:
         checks.append({"name": "inventory", "status": "ok", "detail": "stock above reorder level"})
+    active = [result for result in rt.aggregator.state().results if result.active]
+    failed = sum(1 for result in active if result.status == "failed")
+    stale = sum(1 for result in active if result.stale_reason)
+    if failed:
+        checks.append({"name": "aggregation", "status": "fail", "detail": f"{failed} groups failed"})
+    elif stale:
+        checks.append({"name": "aggregation", "status": "warn", "detail": f"{stale} stale aggregates"})
+    else:
+        checks.append({"name": "aggregation", "status": "ok", "detail": "aggregates current"})
     return checks

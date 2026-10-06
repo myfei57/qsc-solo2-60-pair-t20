@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from waterplant.audit import Auditor
 from waterplant.backwash import Controller
@@ -11,6 +12,7 @@ from waterplant.chlor import Doser as ChlorDoser
 from waterplant.chlor import validate_demand
 from waterplant.clearwell import Well, validate_level
 from waterplant.coag import Doser as CoagDoser
+from waterplant.dosing import Aggregator, BasisLedger, CumulativeLedger, ShiftSchedule
 from waterplant.filter import Bank, validate_zone
 from waterplant.flow import Calibration, calibrate_meter, validate_factor
 from waterplant.intake import FlowRepository, InletController, Sensor, mix, validate_flow
@@ -315,12 +317,15 @@ class QuotaCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store.open(f"{tmp}/state.json")
             accumulator = Accumulator(store)
-            self.assertEqual(accumulator.add(10.0), 10.0)
+            self.assertEqual(accumulator.add(10.0, "2026-10-05T08:00:00Z"), 10.0)
             self.assertEqual(accumulator.value(), 10.0)
             self.assertEqual(accumulator.remaining(30.0), 20.0)
             self.assertEqual(accumulator.remaining(5.0), 0.0)
-            accumulator.reset()
+            self.assertEqual(accumulator.add(90.0, "2026-10-05T09:00:00Z"), 0.0)
+            accumulator.reset("2026-10-05T10:00:00Z")
             self.assertEqual(accumulator.value(), 0.0)
+            cumulative = CumulativeLedger(store)
+            self.assertEqual([entry.value for entry in cumulative.entries("chlorine")], [10.0, 0.0, 0.0])
             self.assertIn("quota accumulator", accumulator.describe())
 
     def test_check_quota_and_validation(self) -> None:
@@ -480,6 +485,170 @@ class InventoryCase(unittest.TestCase):
             validate_quantity(0.0)
             with self.assertRaises(ValueError):
                 validate_quantity(-1.0, "level")
+
+
+class DosingAggregationCase(unittest.TestCase):
+    def _records(self, store: Store) -> None:
+        auditor = Auditor(store)
+        auditor.record(
+            "coagulant",
+            "10.0000",
+            at="2026-10-05T09:00:00Z",
+            raw_amount=10.0,
+            calibration=1.0,
+            concentration=1.0,
+        )
+        auditor.supplement(
+            "coagulant",
+            2.0,
+            at="2026-10-05T10:00:00Z",
+            raw_amount=2.0,
+            calibration=1.0,
+            concentration=1.0,
+        )
+        auditor.record(
+            "chlorine",
+            "3.0000",
+            at="2026-10-05T09:30:00Z",
+            raw_amount=3.0,
+            calibration=1.0,
+            concentration=1.0,
+        )
+
+    def test_shift_uses_crew_handover_and_groups_by_chemical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            schedule = ShiftSchedule(store)
+            day = schedule.locate("2026-10-05T09:00:00Z")
+            night = schedule.locate("2026-10-05T17:00:00Z")
+            self.assertEqual(day.key, "2026-10-05-B")
+            self.assertEqual(night.key, "2026-10-05-C")
+            schedule.set([7 * 60, 15 * 60], ["early", "late"])
+            shifted = schedule.locate("2026-10-05T09:00:00Z")
+            self.assertEqual(shifted.team, "early")
+            self.assertEqual(shifted.start, "2026-10-05T07:00:00Z")
+            with self.assertRaises(ValueError):
+                schedule.set([-1])
+
+    def test_historical_basis_is_applied_to_each_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            basis = BasisLedger(store)
+            basis.set("coagulant", 2.0, 1.0, effective_from="2026-10-05T08:00:00Z")
+            basis.set("coagulant", 3.0, 1.0, effective_from="2026-10-05T10:00:00Z")
+            self.assertEqual(basis.effective("coagulant", "2026-10-05T09:59:00Z").calibration, 2.0)
+            self.assertEqual(basis.effective("coagulant", "2026-10-05T10:00:00Z").calibration, 3.0)
+
+    def test_reconciles_dose_cumulative_and_inventory_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            self._records(store)
+            inventory = Inventory(store)
+            inventory.receive("coagulant", "L1", 100.0, at="2026-10-05T08:00:00Z")
+            inventory.consume("coagulant", 12.0, at="2026-10-05T10:30:00Z")
+            inventory.receive("chlorine", "L9", 10.0, at="2026-10-05T08:00:00Z")
+            inventory.consume("chlorine", 3.0, at="2026-10-05T11:00:00Z")
+            cumulative = CumulativeLedger(store)
+            for chemical, end in (("coagulant", 12.0), ("chlorine", 3.0)):
+                cumulative.record(chemical, 0.0, at="2026-10-05T08:00:00Z")
+                cumulative.record(chemical, end, at="2026-10-05T16:00:00Z")
+
+            aggregator = Aggregator(store)
+            run = aggregator.run()
+            self.assertEqual(run.status, "ok")
+            results = {result.chemical: result for result in aggregator.active_results()}
+            self.assertEqual(results["coagulant"].dose_total, 12.0)
+            self.assertEqual(results["coagulant"].cumulative_total, 12.0)
+            self.assertEqual(results["coagulant"].inventory_total, 12.0)
+            self.assertEqual(results["coagulant"].status, "ready")
+            self.assertEqual(len(results["coagulant"].entries), 2)
+            self.assertEqual(results["chlorine"].dose_total, 3.0)
+
+    def test_publishes_discrepant_result_and_names_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            self._records(store)
+            inventory = Inventory(store)
+            inventory.receive("coagulant", "L1", 100.0, at="2026-10-05T08:00:00Z")
+            inventory.consume("coagulant", 10.0, at="2026-10-05T10:30:00Z")
+            cumulative = CumulativeLedger(store)
+            cumulative.record("coagulant", 0.0, at="2026-10-05T08:00:00Z")
+            cumulative.record("coagulant", 11.0, at="2026-10-05T16:00:00Z")
+
+            aggregator = Aggregator(store)
+            aggregator.run()
+            result = aggregator.active_results("coagulant")[0]
+            self.assertEqual(result.status, "discrepant")
+            sources = {item["source"] for item in result.discrepancies}
+            self.assertEqual(sources, {"cumulative", "inventory"})
+            self.assertTrue(all(item["segment"]["key"] == result.shift.key for item in result.discrepancies))
+
+    def test_supplement_makes_old_aggregate_stale_and_rerun_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            auditor = Auditor(store)
+            auditor.record(
+                "coagulant",
+                "10.0000",
+                at="2026-10-05T09:00:00Z",
+                raw_amount=10.0,
+                calibration=1.0,
+                concentration=1.0,
+            )
+            aggregator = Aggregator(store)
+            aggregator.run()
+            self.assertEqual(aggregator.active_results()[0].stale_reason, "")
+            auditor.supplement(
+                "coagulant",
+                2.0,
+                at="2026-10-05T10:00:00Z",
+                raw_amount=2.0,
+                calibration=1.0,
+                concentration=1.0,
+            )
+            self.assertEqual(
+                aggregator.active_results()[0].stale_reason,
+                "source-changed-after-aggregation",
+            )
+            aggregator.run()
+            active = aggregator.active_results()
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].dose_total, 12.0)
+            self.assertEqual(aggregator.run().unchanged, 1)
+            versions = aggregator.state().results
+            self.assertEqual([item.active for item in versions], [False, True])
+
+    def test_partial_failure_is_persisted_and_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            self._records(store)
+
+            def broken_delta(self, chemical: str, start: int, end: int):
+                if chemical == "coagulant":
+                    raise RuntimeError("cumulative segment unavailable")
+                return None, None
+
+            aggregator = Aggregator(store)
+            with patch.object(CumulativeLedger, "delta", broken_delta):
+                run = aggregator.run()
+            self.assertEqual(run.status, "partial_failure")
+            self.assertEqual(run.failed, 1)
+            self.assertEqual(run.calculated, 1)
+            checkpoint = aggregator.state().checkpoints["coagulant|2026-10-05-B"]
+            self.assertEqual(checkpoint["status"], "failed")
+
+            recovered = aggregator.run()
+            self.assertEqual(recovered.status, "ok")
+            self.assertEqual(recovered.failed, 0)
+            self.assertEqual(aggregator.state().checkpoints["coagulant|2026-10-05-B"]["status"], "discrepant")
+
+    def test_aggregation_does_not_change_source_audit_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            self._records(store)
+            before = list(store.get("audit:entries"))
+            Aggregator(store).run()
+            self.assertEqual(store.get("audit:entries"), tuple(before))
 
 
 class ReportingCase(unittest.TestCase):
